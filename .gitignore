@@ -1,0 +1,33 @@
+# Secrets and local settings (only the template is committed)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Spark checkpoints and local runtime files
+checkpoints/
+spark-checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Docker local volumes and data dumps
+volumes/
+*.dump
+*.sql.gz
+
+# Logs
+*.log
+logs/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
