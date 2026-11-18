@@ -4,6 +4,8 @@
 
 Each Kafka message is a **snapshot of one customer at a point in time**, serialized in UTF-8 JSON. This file is the **single source of truth** for field names, types and rules. Any change must be approved by Member 1 and announced to the entire team the same day.
 
+> **Flow note (2026-11-18):** the source of the messages is now a dataset replayed by a Python producer, and the flagging of customers at risk is done in Spark with points (`docs/scoring_rules.md`, to be agreed). **The field definitions, rules and samples in this contract are unchanged.** They will be revisited once the team chooses the dataset.
+
 ---
 
 ## 1. Time Windows and Time Semantics
@@ -190,6 +192,8 @@ If the message was valid JSON, all its original fields are preserved next to the
 | `RULE_7_CHURN_DATE` | Churn status and date inconsistent |
 | `RULE_8_INVALID_ENUM` | Value outside its allowed list |
 
+**Retention:** messages in `churn.dlq` are kept **without a time limit** (`retention.ms=-1`) and nothing consumes them for now. They stay there to be read later, and the team decides what to do with them.
+
 ---
 
 ## 9. Customer State Rule (Spark and Database)
@@ -290,3 +294,4 @@ The database keeps **one row per customer** with the latest snapshot. A new snap
 | **v1.1** | Replaced `plan_changes_count` with `plan_changes_6m` (rolling 6-month window); limited `last_plan_change*` fields to 6 months; defined time windows and purchase and plan-change validation rules. |
 | **v1.2** | Exact cutoffs and output values for the 6 enrichment fields; added the `churn.dlq` schema; standardized allowed Egyptian cities. |
 | **v1.3** | Real-time `event_timestamp` with backdated plan history; churn lifecycle (one final snapshot) and `churn_date` not after the event date; defined cleaning limits and processing order; rules evaluated in order with error codes; invalid JSON handled through `raw_payload`; numeric price comparison; clearer `age` ranges; `age_group` labels changed to `under_25`, `25_40`, `41_60`, `over_60`; added the customer state rule (newest timestamp wins); added the plan catalog master file. |
+| **v1.3 note** | 2026-11-18: no change to fields or rules. Added the flow note at the top and the `churn.dlq` retention rule (Section 8). |
