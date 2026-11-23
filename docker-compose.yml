@@ -1,0 +1,205 @@
+# ==============================================================================
+# Real-Time Customer Churn Analytics - Docker stack (7 containers, 1 network)
+# kafka | kafka-ui | nifi | spark-master | spark-worker | db (MySQL) | grafana
+# Start:  docker compose up -d --build
+# ==============================================================================
+
+services:
+  # ---------------------------------------------------------------- Kafka
+  kafka:
+    container_name: kafka
+    image: apache/kafka:3.7.0
+    restart: unless-stopped
+    ports:
+      - "9094:9094"          # EXTERNAL listener: for the Python producer on your laptop
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094'
+      # kafka:9092 = from other containers | localhost:9094 = from your laptop
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # Topics are created ONLY by scripts/create_topics.sh (so churn.dlq always
+      # gets retention.ms=-1 and a typo can never create a topic with 7 days).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      # FIX: must be a valid 22-character base64 UUID (the old value had 24 chars).
+      CLUSTER_ID: '5L6g3nShT-eMCtK--X86sw'
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - churn-net
+
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - churn-net
+
+  # ---------------------------------------------------------------- NiFi
+  nifi:
+    container_name: nifi
+    image: apache/nifi:1.26.0
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USERNAME:?Copy .env.example to .env first}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD:?Copy .env.example to .env first}
+      NIFI_WEB_HTTPS_PORT: '8443'
+      NIFI_JVM_HEAP_INIT: '1g'
+      NIFI_JVM_HEAP_MAX: '1g'
+    volumes:
+      - nifi_state:/opt/nifi/nifi-current/state
+      - nifi_conf:/opt/nifi/nifi-current/conf          # FIX: keeps the flow after `docker compose down`
+      - ./nifi/lookup_tables:/opt/nifi/lookup_tables:ro # plan_catalog.csv for the NiFi lookup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - churn-net
+
+  # ---------------------------------------------------------------- Spark
+  spark-master:
+    container_name: spark-master
+    build:
+      context: ./docker/spark        # FIX: plain apache/spark has NO Python; this adds PySpark + pymysql
+    image: churn-spark:3.5.1
+    restart: unless-stopped
+    user: root                       # avoids permission errors on volumes and the ivy cache
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master -h spark-master -p 7077 --webui-port 8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    environment:
+      DB_NAME: ${DB_NAME}            # so Spark code can read the DB login with os.environ
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./docker/spark:/opt/spark-apps:ro                 # FIX: your Spark code is visible inside the container
+      - spark_checkpoints:/opt/spark-checkpoints   # FIX: checkpoints survive container restarts
+      - spark_ivy:/tmp/.ivy2                       # caches the downloaded --packages jars
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - churn-net
+
+  spark-worker:
+    container_name: spark-worker
+    build:
+      context: ./docker/spark
+    image: churn-spark:3.5.1
+    restart: unless-stopped
+    user: root
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081
+    environment:
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./docker/spark:/opt/spark-apps:ro
+      - spark_checkpoints:/opt/spark-checkpoints
+    depends_on:
+      spark-master:
+        condition: service_started
+    networks:
+      - churn-net
+
+  # ---------------------------------------------------------------- MySQL
+  db:
+    container_name: db
+    image: mysql:8.0.36            # FIX: exact tag (README rule: pinned, never floating)
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+00:00   # contract says all timestamps are UTC
+    ports:
+      - "${DB_HOST_PORT:-3306}:3306"
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:?Copy .env.example to .env first}
+      MYSQL_USER: ${DB_USER:?Copy .env.example to .env first}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Copy .env.example to .env first}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?Copy .env.example to .env first}
+    healthcheck:
+      # FIX 1: the old line used $${DB_ROOT_PASSWORD}, a variable that does not exist
+      #        inside the container (it is called MYSQL_ROOT_PASSWORD there).
+      # FIX 2: -h 127.0.0.1 (TCP) instead of localhost (socket), so the check does not
+      #        pass while MySQL is still running its temporary init server.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d:ro   # runs *.sql ONLY on the first start (empty volume)
+    networks:
+      - churn-net
+
+  # ---------------------------------------------------------------- Grafana
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:10.4.0
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?Copy .env.example to .env first}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Copy .env.example to .env first}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - churn-net
+
+volumes:
+  kafka_data:
+    name: churn_kafka_data
+  mysql_data:
+    name: churn_mysql_data
+  grafana_data:
+    name: churn_grafana_data
+  nifi_state:
+    name: churn_nifi_state
+  nifi_conf:
+    name: churn_nifi_conf
+  spark_checkpoints:
+    name: churn_spark_checkpoints
+  spark_ivy:
+    name: churn_spark_ivy
+
+networks:
+  churn-net:
+    name: churn-network
+    driver: bridge
